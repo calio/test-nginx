@@ -19,6 +19,7 @@ use File::Temp qw( tempfile );
 use POSIX ":sys_wait_h";
 
 use Test::Nginx::Util qw(
+  check_accum_error_log
   is_running
   $NoLongString
   no_long_string
@@ -80,7 +81,7 @@ our @EXPORT = qw( plan run_tests run_test
   no_long_string workers master_on master_off
   log_level no_shuffle no_root_location
   server_addr server_root html_dir server_port
-  timeout no_nginx_manager
+  timeout no_nginx_manager check_accum_error_log
 );
 
 our $TotalConnectingTimeouts = 0;
@@ -452,7 +453,9 @@ sub get_req_from_block ($) {
 }
 
 sub run_test_helper ($$) {
-    my ( $block, $dry_run ) = @_;
+    my ($block, $dry_run, $repeated_req_idx) = @_;
+
+    #warn "repeated req idx: $repeated_req_idx";
 
     my $name = $block->name;
 
@@ -634,7 +637,7 @@ again:
         }
 
         if ($n || $req_idx < @$r_req_list - 1) {
-            check_error_log($block, $res, $dry_run, $req_idx, $need_array);
+            check_error_log($block, $res, $dry_run, $repeated_req_idx, $need_array);
         }
 
         $req_idx++;
@@ -654,7 +657,7 @@ again:
 
     test_stap($block, $dry_run);
 
-    check_error_log($block, $res, $dry_run, $req_idx, $need_array);
+    check_error_log($block, $res, $dry_run, $repeated_req_idx, $need_array);
 }
 
 
@@ -883,13 +886,62 @@ sub value_contains ($$) {
     return undef;
 }
 
-sub check_error_log ($$$$$) {
-    my ($block, $res, $dry_run, $req_idx, $need_array) = @_;
+sub check_error_log ($$$$) {
+    my ($block, $res, $dry_run, $repeated_req_idx, $need_array) = @_;
     my $name = $block->name;
     my $lines;
 
     my $check_alert_message = 1;
     my $check_crit_message = 1;
+
+    my $grep_pat;
+    my $grep_pats = $block->grep_error_log;
+    if (defined $grep_pats) {
+        if (ref $grep_pats && ref $grep_pats eq 'ARRAY') {
+            $grep_pat = $grep_pats->[$repeated_req_idx];
+
+        } else {
+            $grep_pat = $grep_pats;
+        }
+    }
+
+    if (defined $grep_pat) {
+        my $expected = $block->grep_error_log_out;
+        if (!defined $expected) {
+            bail_out("$name - No --- grep_error_log_out defined but --- grep_error_log is defined");
+        }
+
+        if (ref $expected) {
+            $expected = $expected->[$repeated_req_idx];
+
+        } else {
+            $expected = $expected;
+        }
+
+        SKIP: {
+            skip "$name - error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+
+            $lines = error_log_data();
+
+            my $matched_lines = '';
+            for my $line (@$lines) {
+                if (ref $grep_pat && $line =~ /$grep_pat/ || $line =~ /\Q$grep_pat\E/) {
+                    my $matched = $&;
+                    if ($matched !~ /\n/) {
+                        $matched_lines .= $matched . "\n";
+                    }
+                }
+            }
+
+            if ($NoLongString) {
+                is($matched_lines, $expected,
+                   "$name - grep_error_log_out (req $repeated_req_idx)" );
+            } else {
+                is_string($matched_lines, $expected,
+                          "$name - grep_error_log_out (req $repeated_req_idx)");
+            }
+        }
+    }
 
     if (defined $block->error_log) {
         my $pats = $block->error_log;
@@ -922,7 +974,7 @@ sub check_error_log ($$$$$) {
                 if (ref $pat && $line =~ /$pat/ || $line =~ /\Q$pat\E/) {
                     SKIP: {
                         skip "$name - error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
-                        pass("$name - pattern \"$pat\" matches a line in error.log");
+                        pass("$name - pattern \"$pat\" matches a line in error.log (req $repeated_req_idx)");
                     }
                     undef $pat;
                 }
@@ -933,7 +985,7 @@ sub check_error_log ($$$$$) {
             if (defined $pat) {
                 SKIP: {
                     skip "$name - error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
-                    fail("$name - pattern \"$pat\" matches a line in error.log");
+                    fail("$name - pattern \"$pat\" matches a line in error.log (req $repeated_req_idx)");
                     #die join("", @$lines);
                 }
             }
@@ -1023,7 +1075,7 @@ sub check_error_log ($$$$$) {
                         skip "$name - no_error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
                         my $ln = fmt_str($line);
                         my $p = fmt_str($pat);
-                        fail("$name - pattern \"$p\" should not match any line in error.log but matches line \"$ln\"");
+                        fail("$name - pattern \"$p\" should not match any line in error.log but matches line \"$ln\" (req $repeated_req_idx)");
                     }
                     undef $pat;
                 }
@@ -1035,7 +1087,7 @@ sub check_error_log ($$$$$) {
                 SKIP: {
                     skip "$name - no_error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
                     my $p = fmt_str($pat);
-                    pass("$name - pattern \"$p\" does not match a line in error.log");
+                    pass("$name - pattern \"$p\" does not match a line in error.log (req $repeated_req_idx)");
                 }
             }
         }
@@ -2130,7 +2182,7 @@ be an array and each request B<MUST> match the corresponding pattern.
 
 =head2 response_body_unlike
 
-Just like `response_body_like` but this test only pass when the specified pattern
+Just like C<response_body_like> but this test only pass when the specified pattern
 does I<not> match the actual response body data.
 
 =head2 response_headers
@@ -2278,9 +2330,10 @@ Multiple patterns are also supported, for example:
 then the substring "abc" must appear literally in a line of F<error.log>, and the regex C<qr/blah>
 must also match a line in F<error.log>.
 
-=head2 ordered_error_log
 
 Like F<error_log>, but checks if the pattern or multiple patterns appear in lines or the F<error.log> file as the order in the patterns
+=======
+By default, only the part of the error logs corresponding to the current request is checked. You can make it check accumulated error logs by calling the C<check_accum_error_log> Perl function before calling C<run_tests> in the boilerplate Perl code above the C<__DATA__> line.
 
 =head2 abort
 
@@ -2315,6 +2368,31 @@ Just like the C<--- error_log> section, one can also specify multiple patterns:
 
 Then if any line in F<error.log> contains the string C<"abc"> or match the Perl regex C<qr/blah/>, then the test will fail.
 
+=head2 grep_error_log
+
+This section specifies the Perl regex pattern for filtering out the Nginx error logs.
+
+You can specify a verbatim substring being matched in the error log messages, as in
+
+    --- grep_error_log chop
+    some thing we want to see
+
+or specify a Perl regex object to match against the error log message lines, as in
+
+    --- grep_error_log eval
+    qr/something should be: \d+/
+
+All the matched substrings in the error log messages will be concatenated by a newline character as a whole to be compared with the value of the C<--- grep_error_log_out> section.
+
+=head2 grep_error_log_out
+
+This section contains the expected output for the filtering operations specified by the C<--- grep_error_log> section.
+
+If the filtered output varies among the repeated requests (specified by the C<repeat_each> function, then you can specify a Perl array as the value, as in
+
+    --- grep_error_log_out eval
+    ["output for req 0", "output for req 1"]
+
 =head2 log_level
 
 Overrides the default error log level for the current test block.
@@ -2323,7 +2401,7 @@ For example:
 
     --- log_level: debug
 
-The default error log level can be specified in the Perl code by calling the `log_level()` function, as in
+The default error log level can be specified in the Perl code by calling the C<log_level()> function, as in
 
     use Test::Nginx::Socket;
 

@@ -55,6 +55,8 @@ our $Timeout = $ENV{TEST_NGINX_TIMEOUT} || 3;
 
 our $CheckLeak = $ENV{TEST_NGINX_CHECK_LEAK} || 0;
 
+our $CheckAccumErrLog = $ENV{TEST_NGINX_CHECK_ACCUM_ERR_LOG};
+
 our $ServerAddr = 'localhost';
 
 our $StapOutFileHandle;
@@ -63,6 +65,8 @@ our @RandStrAlphabet = ('A' .. 'Z', 'a' .. 'z', '0' .. '9',
     '#', '@', '-', '_', '^');
 our $CurErrorLogPos = 0;
 our $ErrorLogPos = 0;
+
+our $ErrLogFilePos;
 
 if ($CheckLeak) {
     if ($UseStap) {
@@ -236,6 +240,10 @@ sub log_level (@) {
     }
 }
 
+sub check_accum_error_log () {
+    $CheckAccumErrLog = 1;
+}
+
 sub master_on () {
     if ($CheckLeak) {
         return;
@@ -260,6 +268,7 @@ sub master_process_enabled (@) {
 }
 
 our @EXPORT_OK = qw(
+    check_accum_error_log
     is_running
     $NoLongString
     no_long_string
@@ -456,10 +465,16 @@ sub error_log_data () {
     open my $in, $ErrLogFile or
         return undef;
 
-    seek $in, $ErrorLogPos, 0;
+    if (!$CheckAccumErrLog && $ErrLogFilePos > 0) {
+        seek $in, $ErrLogFilePos, 0;
+    }
+
     my @lines = <$in>;
 
-    $CurErrorLogPos = tell($in);
+    if (!$CheckAccumErrLog) {
+        $ErrLogFilePos = tell($in);
+    }
+
     close $in;
     return \@lines;
 }
@@ -1457,8 +1472,7 @@ request:
     }
 
     my $i = 0;
-    $ErrorLogPos = 0;
-    $CurErrorLogPos = 0;
+    $ErrLogFilePos = 0;
     while ($i++ < $RepeatEach) {
         #warn "Use hup: $UseHup, i: $i\n";
 
@@ -1810,18 +1824,18 @@ request:
             SKIP: {
                 Test::More::skip("$name - $skip_reason", $tests_to_skip);
 
-                $RunTestHelper->($block, $dry_run);
+                $RunTestHelper->($block, $dry_run, $i - 1);
             }
 
         } elsif ($should_todo) {
             TODO: {
                 local $TODO = "$name - $todo_reason";
 
-                $RunTestHelper->($block, $dry_run);
+                $RunTestHelper->($block, $dry_run, $i - 1);
             }
 
         } else {
-            $RunTestHelper->($block, $dry_run);
+            $RunTestHelper->($block, $dry_run, $i - 1);
         }
 
         if (defined $udp_socket) {
